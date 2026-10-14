@@ -54,7 +54,9 @@ class RunTracker:
 
     def record_result(self, tool_name: str, tool_args: Any, result: Any) -> Outcome:
         key = args_key(tool_args)
-        outcome = classify(result, self.seen_evidence, f"{tool_name}:{key}")
+        outcome = classify(
+            result, self.seen_evidence, f"{tool_name}:{key}", _arg_values(tool_args)
+        )
         if outcome is Outcome.PRODUCTIVE:
             self.streak.clear()
             self.reflected = False
@@ -105,6 +107,13 @@ def args_key(tool_args: Any) -> str:
         return json.dumps(tool_args, sort_keys=True, default=str, separators=(",", ":"))
     except (TypeError, ValueError):
         return str(tool_args)
+
+
+def _arg_values(tool_args: Any) -> frozenset[str]:
+    """The call's own argument values, which results often echo back."""
+    if not isinstance(tool_args, dict):
+        return frozenset()
+    return frozenset(str(value) for value in tool_args.values() if value is not None)
 
 
 def _listed_calls(streak: list[CallRecord]) -> str:

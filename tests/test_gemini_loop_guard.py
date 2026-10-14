@@ -92,6 +92,122 @@ class TestClassify:
         assert outcomes.classify(result, set()) is Outcome.EMPTY
 
 
+class TestRealToolShapes:
+    """Results exactly as core's tools and the output-limit harness return them."""
+
+    @staticmethod
+    def shell(command: str, stdout: str = "", stderr: str = "", exit_code: int = 0):
+        from code_puppy.tools.command_runner import ShellCommandOutput
+
+        return ShellCommandOutput(
+            success=exit_code == 0,
+            command=command,
+            error="" if exit_code == 0 else "The process didn't exit cleanly!",
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            execution_time=0.4,
+        )
+
+    @staticmethod
+    def spill(handle: str, preview: str = '{"matches": [{"line": "x"}]}'):
+        from pydantic_ai.messages import ToolReturn
+
+        return ToolReturn(
+            return_value=(
+                f"[Tool output too large (12,000 chars); stored to handle {handle!r}. "
+                f"Read it with read_tool_result(handle={handle!r}, offset=0, "
+                "limit=200, from_end=False, pattern=None).]\n"
+                f"shape: {{matches: list}}\n{preview}"
+            )
+        )
+
+    def test_real_grep_output(self):
+        from code_puppy.tools.file_operations import GrepOutput, MatchInfo
+
+        seen: set[str] = set()
+        match = MatchInfo(
+            file_path="a.py", line_number=3, line_content="x", is_context=False
+        )
+        assert outcomes.classify(GrepOutput(matches=[]), seen) is Outcome.EMPTY
+        assert (
+            outcomes.classify(GrepOutput(matches=[match]), seen) is Outcome.PRODUCTIVE
+        )
+        assert outcomes.classify(GrepOutput(matches=[match]), seen) is Outcome.REPEAT
+
+    def test_shell_command_that_prints_nothing_is_empty(self):
+        tracker = policy.RunTracker()
+        for command in ('git log -S "x"', 'git log -G "x"', 'git log --grep "x"'):
+            outcome = tracker.record_result(
+                "agent_run_shell_command", {"command": command}, self.shell(command)
+            )
+            assert outcome is Outcome.EMPTY
+
+    def test_shell_command_with_output_is_productive(self):
+        tracker = policy.RunTracker()
+        args = {"command": "git log --oneline"}
+        result = self.shell(args["command"], stdout="abc123 fix")
+        assert (
+            tracker.record_result("agent_run_shell_command", args, result)
+            is Outcome.PRODUCTIVE
+        )
+
+    def test_failed_shell_command_without_output_is_error(self):
+        tracker = policy.RunTracker()
+        args = {"command": "false"}
+        result = self.shell("false", exit_code=1)
+        assert (
+            tracker.record_result("agent_run_shell_command", args, result)
+            is Outcome.ERROR
+        )
+
+    def test_same_large_output_spilled_twice_is_a_repeat(self):
+        seen: set[str] = set()
+        assert outcomes.classify(self.spill("h1"), seen, "grep:a") is Outcome.PRODUCTIVE
+        assert outcomes.classify(self.spill("h2"), seen, "grep:b") is Outcome.REPEAT
+
+    def test_different_large_outputs_are_productive(self):
+        seen: set[str] = set()
+        outcomes.classify(self.spill("h1", "first"), seen, "grep:a")
+        assert (
+            outcomes.classify(self.spill("h2", "second"), seen, "grep:b")
+            is Outcome.PRODUCTIVE
+        )
+
+    def test_tool_return_wrapping_structured_output_is_unwrapped(self):
+        from pydantic_ai.messages import ToolReturn
+
+        assert outcomes.classify(ToolReturn(return_value=empty_grep()), set()) is (
+            Outcome.EMPTY
+        )
+
+    def test_reworded_lookups_that_find_nothing_trigger_reflection(self):
+        """Modelled on a real Gemini loop: lookups retried with small
+        variations, each failing silently or printing nothing."""
+        tracker = policy.RunTracker()
+        lookups = [
+            self.shell("cfg.py db-get KEY", exit_code=1),
+            self.shell("cfg.py rest get KEY"),
+            self.shell('git log -S "KEY"'),
+            self.shell("cfg.py rest dump", exit_code=1),
+        ]
+        decisions = [
+            run_call(tracker, "agent_run_shell_command", {"command": r.command}, r)
+            for r in lookups
+        ]
+        assert decisions[:3] == [None] * 3
+        assert "context_message" in decisions[3]
+
+    def test_large_output_seen_again_counts_toward_the_streak(self):
+        tracker = policy.RunTracker()
+        run_call(tracker, "grep", {"search_string": "-i cooldown"}, self.spill("h1"))
+        for n, handle in enumerate(("h2", "h3", "h4")):
+            run_call(
+                tracker, "grep", {"search_string": f"cooldown {n}"}, self.spill(handle)
+            )
+        assert len(tracker.streak) == 3
+
+
 # ---------------------------------------------------------------------------
 # policy.RunTracker
 # ---------------------------------------------------------------------------
