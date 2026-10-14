@@ -7,6 +7,8 @@ Levels, checked on every tool call (see the plugin README):
   nothing productive happened since, so it would return the same thing.
 - L1 reflect: once per streak, show the model the facts of its streak and
   permission to stop. The tool still runs.
+- Variation reflect: once per run of near-identical search/shell calls,
+  whatever they returned (see ``variation``). Reflects only, never blocks.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .outcomes import OUTCOME_LABELS, Outcome, classify
+from .variation import VariationDetector
 
 _ARGS_PREVIEW_CHARS = 80
 _MAX_LISTED_CALLS = 5
@@ -26,6 +29,7 @@ class GuardSettings:
     reflect_after: int = 3
     dedupe: bool = True
     block_after: int = 0
+    variation_after: int = 3
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class RunTracker:
     # Streak calls before this index may not be deduped: a call with an unknown
     # outcome (e.g. a file write another hook annotated) may have changed state.
     dedupe_from: int = 0
+    variation: VariationDetector = field(default_factory=VariationDetector)
 
     def record_result(self, tool_name: str, tool_args: Any, result: Any) -> Outcome:
         key = args_key(tool_args)
@@ -81,13 +86,23 @@ class RunTracker:
                 self.streak.append(CallRecord(tool_name, key, Outcome.REPEAT))
                 return {"blocked": True, "tool_result": _dedupe_message(earlier)}
 
-        if (
+        look_alikes = self.variation.observe(
+            tool_name, tool_args, settings.variation_after
+        )
+        streak_reflect = (
             settings.reflect_after
             and not self.reflected
             and len(self.streak) >= settings.reflect_after
-        ):
+        )
+        if streak_reflect:
             self.reflected = True
-            return {"context_message": _reflect_message(self.streak)}
+        messages = []
+        if streak_reflect:
+            messages.append(_streak_text(self.streak))
+        if look_alikes:
+            messages.append(look_alikes)
+        if messages:
+            return {"context_message": "[loop check] " + "\n\n".join(messages)}
         return None
 
     def _find_in_streak(self, tool_name: str, key: str) -> CallRecord | None:
@@ -125,9 +140,9 @@ def _listed_calls(streak: list[CallRecord]) -> str:
     )
 
 
-def _reflect_message(streak: list[CallRecord]) -> str:
+def _streak_text(streak: list[CallRecord]) -> str:
     return (
-        f"[loop check] Your last {len(streak)} tool calls found nothing new:\n"
+        f"Your last {len(streak)} tool calls found nothing new:\n"
         f"{_listed_calls(streak)}\n"
         "More variations of the same search are unlikely to help. If what you "
         "are looking for may not exist, it is fine to say so and summarize "

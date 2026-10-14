@@ -33,6 +33,14 @@ it. Call count alone never triggers anything, so long refactors are unaffected.
 | L1 reflect | Streak reaches N | Tool runs; the model also sees its last calls and that it may stop and say what it checked. Once per streak. | `gemini_loop_guard_reflect_after` (3, 0 = off) |
 | L2 dedupe | Exact repeat of a call already in the streak | Not re-run; the model gets a short factual result instead. | `gemini_loop_guard_dedupe` (on) |
 | L3 backstop | Streak reaches N | Tool blocked so the model must answer. Last resort. | `gemini_loop_guard_block_after` (0 = off) |
+| Variation reflect | N near-identical `grep`/shell calls within the last 8, **whatever they returned** | Tool runs; the model sees the look-alike calls and that it may answer now. Once per run of look-alikes; never blocks. | `gemini_loop_guard_variation_after` (3, 0 = off) |
+
+The variation check exists because a model digging in the wrong place keeps
+getting *something* back, so the streak never builds. Calls are compared after
+stripping `cd`, env assignments, `source .../activate` and absolute-path
+prefixes; two calls are look-alikes at token similarity >= 0.6. Calls naming
+different files are progress, `read_file`/`list_files` are not watched, edits
+reset the history, and `sleep` polling is exempt.
 
 `/set gemini_loop_guard off` disables everything. Settings apply immediately.
 

@@ -359,14 +359,15 @@ class TestConfig:
     def test_defaults(self):
         config = _module("config")
         assert config.is_enabled() is True
-        assert config.guard_settings() == policy.GuardSettings(3, True, 0)
+        assert config.guard_settings() == policy.GuardSettings(3, True, 0, 3)
 
     def test_values_and_garbage(self):
         config = _module("config")
         set_config_value(config.REFLECT_AFTER_KEY, "5")
         set_config_value(config.BLOCK_AFTER_KEY, "not-a-number")
         set_config_value(config.DEDUPE_KEY, "off")
-        assert config.guard_settings() == policy.GuardSettings(5, False, 0)
+        set_config_value(config.VARIATION_AFTER_KEY, "0")
+        assert config.guard_settings() == policy.GuardSettings(5, False, 0, 0)
 
     @pytest.mark.parametrize(
         "name, expected",
@@ -437,3 +438,169 @@ class TestHooks:
         _loop(hooks, 3)
         hooks.agent = child
         assert _loop(hooks, 3) == [None] * 3
+
+
+# ---------------------------------------------------------------------------
+# variation: same tool, small variations, whatever the calls return
+# ---------------------------------------------------------------------------
+
+variation = _module("variation")
+SHELL = "agent_run_shell_command"
+
+
+def _nudges(tracker, calls, settings=None):
+    """Run (tool, args) calls, each returning something new; collect reflections."""
+    messages = []
+    for number, (tool, args) in enumerate(calls):
+        result = {"stdout": f"fresh output {number}"}
+        decision = run_call(tracker, tool, args, result, settings)
+        if decision and "context_message" in decision:
+            messages.append((number + 1, decision["context_message"]))
+    return messages
+
+
+def _shell(command: str):
+    return SHELL, {"command": command}
+
+
+def _lookups(count: int):
+    """Reworded config lookups: same script, small differences each time."""
+    flags = ["db-show KEY", "db-show 59 KEY", "db-show KEY x", "db-show 740 KEY"]
+    return [
+        _shell(f"python3 tools/cfg.py {flags[n % len(flags)]}") for n in range(count)
+    ]
+
+
+class TestVariation:
+    def test_reworded_calls_reflect_even_though_each_returns_something_new(self):
+        nudges = _nudges(policy.RunTracker(), _lookups(4))
+        assert [number for number, _ in nudges] == [3]
+        message = nudges[0][1]
+        assert "[loop check]" in message
+        assert "near-identical" in message
+        assert "tools/cfg.py db-show KEY" in message
+        assert "answer now" in message
+
+    def test_fires_once_per_run_of_look_alikes(self):
+        nudges = _nudges(policy.RunTracker(), _lookups(8))
+        assert len(nudges) == 1
+
+    def test_never_fires_for_read_file_or_list_files(self):
+        calls = [("read_file", {"file_path": "tools/cfg.py"})] * 6 + [
+            ("list_files", {"directory": "tools"})
+        ] * 6
+        assert _nudges(policy.RunTracker(), calls) == []
+
+    def test_different_symbols_in_the_same_directory_are_different_searches(self):
+        calls = [
+            ("grep", {"search_string": name, "directory": "/repo/some/long/dir"})
+            for name in ("getAlgoTasks", "capacity|consumed", "AUTO_JUDGEMENT")
+        ]
+        assert _nudges(policy.RunTracker(), calls) == []
+
+    def test_looking_at_different_files_is_progress(self):
+        calls = [
+            _shell(f"cd /repo && git show origin/feature-x:src/{name}")
+            for name in ("config.py", "constants.py", "runner.py", "task.py")
+        ]
+        assert _nudges(policy.RunTracker(), calls) == []
+
+    def test_an_edit_clears_the_history(self):
+        tracker = policy.RunTracker()
+        calls = _lookups(2) + [("replace_in_file", {"file_path": "a.py"})]
+        calls += _lookups(2)
+        assert _nudges(tracker, calls) == []
+
+    def test_sleep_polling_is_exempt(self):
+        calls = [
+            _shell(f"sleep 30; tail -n 3 /tmp/run.log # check {n}") for n in range(6)
+        ]
+        assert _nudges(policy.RunTracker(), calls) == []
+
+    def test_zero_disables_it(self):
+        settings = policy.GuardSettings(reflect_after=0, variation_after=0)
+        assert _nudges(policy.RunTracker(), _lookups(8), settings) == []
+
+    def test_threshold_is_configurable(self):
+        settings = policy.GuardSettings(reflect_after=0, variation_after=5)
+        nudges = _nudges(policy.RunTracker(), _lookups(8), settings)
+        assert [number for number, _ in nudges] == [5]
+
+    def test_rearms_once_the_calls_stop_resembling_each_other(self):
+        unrelated = [
+            _shell(command)
+            for command in (
+                "ls docs",
+                "git status",
+                "pwd",
+                "whoami",
+                "date",
+                "uname -a",
+                "df -h",
+                "uptime",
+            )
+        ]
+        calls = _lookups(3) + unrelated + _lookups(3)
+        assert len(_nudges(policy.RunTracker(), calls)) == 2
+
+    def test_one_combined_message_when_both_signals_trigger(self):
+        tracker = policy.RunTracker()
+        settings = policy.GuardSettings(reflect_after=2, variation_after=3)
+        nothing = {"stdout": "", "stderr": ""}
+        decisions = [
+            run_call(
+                tracker,
+                SHELL,
+                {"command": f"python3 tools/cfg.py db-show KEY {suffix}"},
+                nothing,
+                settings,
+            )
+            for suffix in ("a", "b", "c")
+        ]
+        assert decisions[:2] == [None, None]
+        text = decisions[2]["context_message"]
+        assert text.count("[loop check]") == 1
+        assert "found nothing new" in text and "near-identical" in text
+
+    def test_variation_message_alone_does_not_claim_an_empty_streak(self):
+        text = _nudges(policy.RunTracker(), _lookups(3))[0][1]
+        assert "found nothing new" not in text
+
+    def test_never_blocks_whatever_the_backstop_says_about_it(self):
+        tracker = policy.RunTracker()
+        decisions = [
+            run_call(tracker, tool, args, {"stdout": str(n)})
+            for n, (tool, args) in enumerate(_lookups(12))
+        ]
+        assert not any(d and d.get("blocked") for d in decisions)
+
+
+class TestCallShape:
+    def shape(self, command: str):
+        return variation.call_shape(SHELL, {"command": command})
+
+    def test_cd_env_and_activate_noise_is_ignored(self):
+        plain = self.shape("python tools/cfg.py db-show KEY")
+        noisy = self.shape(
+            "cd /Users/x/proj && export FOO=bar && BAZ='a b' source .venv/bin/activate "
+            "&& python tools/cfg.py db-show KEY"
+        )
+        assert noisy.tokens == plain.tokens
+
+    def test_absolute_paths_reduce_to_their_basename(self):
+        a = self.shape(
+            "/Users/alice/proj/.venv/bin/python /Users/alice/proj/tools/run.py"
+        )
+        b = self.shape("/home/bob/other/.venv/bin/python /opt/elsewhere/tools/run.py")
+        assert a.tokens == b.tokens
+
+    def test_options_with_equals_are_kept(self):
+        assert "env" in self.shape("tool --env=dev").tokens
+
+    def test_grep_compares_only_the_pattern(self):
+        a = variation.call_shape("grep", {"search_string": "Foo", "directory": "/a/b"})
+        b = variation.call_shape("grep", {"search_string": "Foo", "directory": "/c/d"})
+        assert a == b
+
+    def test_non_dict_args_do_not_crash(self):
+        assert variation.call_shape(SHELL, "ls -la").tokens == {"ls", "la"}

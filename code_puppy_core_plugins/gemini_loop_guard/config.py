@@ -11,6 +11,7 @@ ENABLED_KEY = "gemini_loop_guard"
 REFLECT_AFTER_KEY = "gemini_loop_guard_reflect_after"
 DEDUPE_KEY = "gemini_loop_guard_dedupe"
 BLOCK_AFTER_KEY = "gemini_loop_guard_block_after"
+VARIATION_AFTER_KEY = "gemini_loop_guard_variation_after"
 
 _DEFAULTS = GuardSettings()
 _FALSY = ("false", "0", "no", "off")
@@ -30,6 +31,7 @@ def guard_settings() -> GuardSettings:
         reflect_after=_count(REFLECT_AFTER_KEY, _DEFAULTS.reflect_after),
         dedupe=_flag(DEDUPE_KEY, default=_DEFAULTS.dedupe),
         block_after=_count(BLOCK_AFTER_KEY, _DEFAULTS.block_after),
+        variation_after=_count(VARIATION_AFTER_KEY, _DEFAULTS.variation_after),
     )
 
 
@@ -91,6 +93,17 @@ SETTINGS = SettingsCategory(
             ),
             type_hint="int",
             effective_getter=lambda: guard_settings().block_after,
+        ),
+        Setting(
+            key=VARIATION_AFTER_KEY,
+            display_name="Loop Guard: Variation After",
+            description=(
+                "Near-identical search/shell calls in a row before the model is "
+                "asked to check it is still making progress, even when each "
+                "call returns something. 0 disables. Default 3."
+            ),
+            type_hint="int",
+            effective_getter=lambda: guard_settings().variation_after,
         ),
     ),
 )
